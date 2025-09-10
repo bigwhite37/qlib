@@ -8,7 +8,7 @@ import datetime
 import importlib
 from pathlib import Path
 from typing import Type, Iterable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import pandas as pd
 from tqdm import tqdm
@@ -293,26 +293,34 @@ class Normalize:
         default_na = pd._libs.parsers.STR_NA_VALUES  # pylint: disable=I1101
         symbol_na = default_na.copy()
         symbol_na.remove("NA")
-        columns = pd.read_csv(file_path, nrows=0).columns
+        
+        # Read CSV with optimized settings - avoid double read for columns
         df = pd.read_csv(
             file_path,
             dtype={self._symbol_field_name: str},
             keep_default_na=False,
-            na_values={col: symbol_na if col == self._symbol_field_name else default_na for col in columns},
         )
+        # Apply na_values only to symbol column after reading
+        for col in df.columns:
+            if col == self._symbol_field_name:
+                df[col] = df[col].replace(symbol_na, pd.NA)
 
         # NOTE: It has been reported that there may be some problems here, and the specific issues will be dealt with when they are identified.
         df = self._normalize_obj.normalize(df)
         if df is not None and not df.empty:
             if self._end_date is not None:
-                _mask = pd.to_datetime(df[self._date_field_name]) <= pd.Timestamp(self._end_date)
+                _mask = pd.to_datetime(df[self._date_field_name], format='mixed') <= pd.Timestamp(self._end_date)
                 df = df[_mask]
             df.to_csv(self._target_dir.joinpath(file_path.name), index=False)
 
     def normalize(self):
         logger.info("normalize data......")
 
-        with ProcessPoolExecutor(max_workers=self._max_workers) as worker:
+        # Use ThreadPoolExecutor for I/O-bound tasks (CSV reading/writing)
+        # This is more efficient than ProcessPoolExecutor for file operations
+        executor_class = ThreadPoolExecutor if self._max_workers > 10 else ProcessPoolExecutor
+        
+        with executor_class(max_workers=self._max_workers) as worker:
             file_list = list(self._source_dir.glob("*.csv"))
             with tqdm(total=len(file_list)) as p_bar:
                 for _ in worker.map(self._executor, file_list):

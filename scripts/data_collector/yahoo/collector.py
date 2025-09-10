@@ -371,7 +371,7 @@ class YahooNormalize(BaseNormalize):
     @staticmethod
     def calc_change(df: pd.DataFrame, last_close: float) -> pd.Series:
         df = df.copy()
-        _tmp_series = df["close"].fillna(method="ffill")
+        _tmp_series = df["close"].ffill()
         _tmp_shift_series = _tmp_series.shift(1)
         if last_close is not None:
             _tmp_shift_series.iloc[0] = float(last_close)
@@ -392,8 +392,12 @@ class YahooNormalize(BaseNormalize):
         columns = copy.deepcopy(YahooNormalize.COLUMNS)
         df = df.copy()
         df.set_index(date_field_name, inplace=True)
-        df.index = pd.to_datetime(df.index)
-        df.index = df.index.tz_localize(None)
+        df.index = pd.to_datetime(df.index, format='mixed', utc=True)
+        if hasattr(df.index, 'tz_localize'):
+            df.index = df.index.tz_localize(None)
+        else:
+            # Convert to DatetimeIndex if it's not already
+            df.index = pd.DatetimeIndex(df.index).tz_localize(None)
         df = df[~df.index.duplicated(keep="first")]
         if calendar_list is not None:
             df = df.reindex(
@@ -459,7 +463,7 @@ class YahooNormalize1d(YahooNormalize, ABC):
         df.set_index(self._date_field_name, inplace=True)
         if "adjclose" in df:
             df["factor"] = df["adjclose"] / df["close"]
-            df["factor"] = df["factor"].fillna(method="ffill")
+            df["factor"] = df["factor"].ffill()
         else:
             df["factor"] = 1
         for _col in self.COLUMNS:
@@ -500,6 +504,10 @@ class YahooNormalize1d(YahooNormalize, ABC):
             # NOTE: retain original adjclose, required for incremental updates
             if _col in [self._symbol_field_name, "adjclose", "change"]:
                 continue
+            
+            # Ensure numeric data types for calculations
+            df[_col] = pd.to_numeric(df[_col], errors='coerce')
+            
             if _col == "volume":
                 df[_col] = df[_col] * _close
             else:
@@ -941,6 +949,8 @@ class Run(BaseRun):
         check_data_length: int = None,
         delay: float = 1,
         exists_skip: bool = False,
+        skip_download: bool = False,
+        skip_normalize: bool = False,
     ):
         """update yahoo data to bin
 
@@ -957,6 +967,10 @@ class Run(BaseRun):
             time.sleep(delay), default 1
         exists_skip: bool
             exists skip, by default False
+        skip_download: bool
+            skip download data from yahoo, by default False
+        skip_normalize: bool
+            skip normalize data step, by default False
         Notes
         -----
             If the data in qlib_data_dir is incomplete, np.nan will be populated to trading_date for the previous trading day
@@ -985,7 +999,10 @@ class Run(BaseRun):
 
         # download data from yahoo
         # NOTE: when downloading data from YahooFinance, max_workers is recommended to be 1
-        self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
+        if not skip_download:
+            self.download_data(delay=delay, start=trading_date, end=end_date, check_data_length=check_data_length)
+        else:
+            logger.info("Skipping download step as requested")
         # NOTE: a larger max_workers setting here would be faster
         self.max_workers = (
             max(multiprocessing.cpu_count() - 2, 1)
@@ -993,7 +1010,10 @@ class Run(BaseRun):
             else self.max_workers
         )
         # normalize data
-        self.normalize_data_1d_extend(qlib_data_1d_dir)
+        if not skip_normalize:
+            self.normalize_data_1d_extend(qlib_data_1d_dir)
+        else:
+            logger.info("Skipping normalize step as requested")
 
         # dump bin
         _dump = DumpDataUpdate(

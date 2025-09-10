@@ -95,7 +95,7 @@ def get_calendar_list(bench_code="CSI300") -> List[pd.Timestamp]:
                         raise ValueError(f"{month}-->{e}") from e
                     return _cal
 
-                month_range = pd.date_range(start="2000-01", end=pd.Timestamp.now() + pd.Timedelta(days=31), freq="M")
+                month_range = pd.date_range(start="2000-01", end=pd.Timestamp.now() + pd.Timedelta(days=31), freq="ME")
                 calendar = []
                 for _m in month_range:
                     cal = _get_calendar(_m.strftime("%Y-%m"))
