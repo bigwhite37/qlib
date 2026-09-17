@@ -1,0 +1,16 @@
+# V0 frozen rule configuration for sleeve/a.
+# Values not listed here use the typed defaults in src/lowvol_trend/config.py.
+data:
+  db_path: /Users/shuzhenyi/code/data/qlib_tmp_correct/qlib_tmp_correct_reindexed.duckdb
+  memory_limit: 2GB
+  start_date: "2015-01-05"
+  end_date: "2026-09-14"
+  backtest_start: "2016-01-04"
+  evaluation_end: "2026-09-14"
+
+execution:
+  initial_cash: 100000.0
+  unknown_st_conservative: false
+
+backtest:
+  run_id_prefix: v0_rules

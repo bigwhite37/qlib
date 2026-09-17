@@ -51,3 +51,12 @@ tags
 ./pretrain
 .idea/
 .aider*
+
+Users/
+cache
+output
+# macOS / 实验产物 / 字节码
+.DS_Store
+mlruns
+__pycache__/
+*.pyc

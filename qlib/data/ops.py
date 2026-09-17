@@ -1667,6 +1667,20 @@ class OpsWrapper:
 Operators = OpsWrapper()
 
 
+def _configured_minute_freq(C):
+    """Return the minute frequency of the configured provider, if any."""
+
+    try:
+        from qlib.utils.time import Freq  # pylint: disable=C0415
+
+        for freq in C.dpm.provider_uri:
+            if Freq(freq).base == Freq.NORM_FREQ_MINUTE:
+                return freq
+    except Exception:  # pragma: no cover - provider_uri is always a mapping here
+        return None
+    return None
+
+
 def register_all_ops(C):
     """register all operator"""
     logger = get_module_logger("ops")
@@ -1675,6 +1689,23 @@ def register_all_ops(C):
 
     Operators.reset()
     Operators.register(OpsList + [P, PRef])
+
+    # A minute provider implies the high-frequency operators; registering them here
+    # removes the "every caller must remember custom_ops" footgun while leaving the
+    # default (day-only) registration untouched.
+    minute_freq = _configured_minute_freq(C)
+    if minute_freq is not None:
+        try:
+            from qlib.contrib.ops.high_freq import HIGH_FREQ_OPS  # pylint: disable=C0415
+
+            Operators.register(HIGH_FREQ_OPS)
+            logger.debug(
+                "minute provider %s detected; registered %s",
+                minute_freq,
+                [op.__name__ for op in HIGH_FREQ_OPS],
+            )
+        except Exception as error:  # pragma: no cover - defensive only
+            logger.warning("could not register high-frequency operators: %s", error)
 
     if getattr(C, "custom_ops", None) is not None:
         Operators.register(C.custom_ops)

@@ -46,17 +46,46 @@ class ProviderBackendMixin:
     It is not necessary to inherent this class if that provider don't rely on the backend storage
     """
 
-    def get_default_backend(self):
+    @staticmethod
+    def _is_duckdb_provider(**provider_kwargs) -> bool:
+        """Check whether the configured provider URI points to a DuckDB database."""
+
+        try:
+            from .storage.duckdb_storage import is_duckdb_uri  # pylint: disable=C0415
+
+            freq = provider_kwargs.get("freq")
+            if freq is not None:
+                return is_duckdb_uri(C.dpm.get_data_uri(freq))
+            return is_duckdb_uri(C.get("provider_uri"))
+        except Exception:
+            # Any formatting/config error means "not a DuckDB provider"; the
+            # file backend below will then raise the original error as before.
+            return False
+
+    def get_default_backend(self, **provider_kwargs):
         backend = {}
         provider_name: str = re.findall("[A-Z][^A-Z]*", self.__class__.__name__)[-2]
-        # set default storage class
-        backend.setdefault("class", f"File{provider_name}Storage")
-        # set default storage module
-        backend.setdefault("module_path", "qlib.data.storage.file_storage")
+        if self._is_duckdb_provider(**provider_kwargs):
+            # set default DuckDB storage class
+            backend.setdefault("class", f"DuckDB{provider_name}Storage")
+            backend.setdefault("module_path", "qlib.data.storage.duckdb_storage")
+        else:
+            # set default storage class
+            backend.setdefault("class", f"File{provider_name}Storage")
+            # set default storage module
+            backend.setdefault("module_path", "qlib.data.storage.file_storage")
         return backend
 
     def backend_obj(self, **kwargs):
-        backend = self.backend if self.backend else self.get_default_backend()
+        if self.backend:
+            backend = self.backend
+        else:
+            try:
+                backend = self.get_default_backend(**kwargs)
+            except TypeError:
+                # Backward compatibility for small custom providers that
+                # override `get_default_backend` without accepting kwargs.
+                backend = self.get_default_backend()
         backend = copy.deepcopy(backend)
         backend.setdefault("kwargs", {}).update(**kwargs)
         return init_instance_by_config(backend)

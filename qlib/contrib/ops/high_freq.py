@@ -119,6 +119,60 @@ class DayLast(ElemOperator):
         return series.groupby(_calendar[series.index], group_keys=False).transform("last")
 
 
+class PrevDayLast(ElemOperator):
+    """Previous trading day's last value (``DayLast(Ref(x, bars_per_day))``).
+
+    ``Ref(x, 1)`` on a flat minute axis silently crosses the overnight gap, and a
+    bare ``DayLast(x)`` is the *current* day's close -- a look-ahead when used as a
+    normalisation anchor.  This operator makes the safe form explicit.
+    """
+
+    def _load_internal(self, instrument, start_index, end_index, freq):
+        _calendar = get_calendar_day(freq=freq)
+        series = self.feature.load(instrument, start_index, end_index, freq)
+        bars_per_day = _bars_per_day(_calendar, series.index)
+        shifted = series.shift(bars_per_day)
+        return shifted.groupby(_calendar[series.index], group_keys=False).transform("last")
+
+
+class DayOpen(ElemOperator):
+    """First value of the day (intraday anchor, counterpart of :class:`DayLast`)."""
+
+    def _load_internal(self, instrument, start_index, end_index, freq):
+        _calendar = get_calendar_day(freq=freq)
+        series = self.feature.load(instrument, start_index, end_index, freq)
+        return series.groupby(_calendar[series.index], group_keys=False).transform("first")
+
+
+class BarOfDay(ElemOperator):
+    """Zero-based index of the bar inside its trading day (counterpart of :class:`Date`)."""
+
+    def _load_internal(self, instrument, start_index, end_index, freq):
+        _calendar = get_calendar_day(freq=freq)
+        series = self.feature.load(instrument, start_index, end_index, freq)
+        day = _calendar[series.index]
+        position = np.arange(len(day), dtype=np.float32)
+        starts = np.searchsorted(day, day, side="left")
+        return pd.Series(position - starts, index=series.index)
+
+
+def _bars_per_day(_calendar, index) -> int:
+    """Bars in one trading day for this calendar.
+
+    The warehouse has exactly 240 bars per symbol-day, but the value is derived from
+    the calendar instead of hard-coded so a future data set with a different session
+    length does not silently shift the previous-day lookup.
+    """
+
+    if len(index) == 0:
+        return 0
+    day = _calendar[index]
+    boundaries = np.flatnonzero(np.r_[True, day[1:] != day[:-1]])
+    if len(boundaries) < 2:
+        return int(len(day))
+    return int(boundaries[1] - boundaries[0])
+
+
 class FFillNan(ElemOperator):
     """FFillNan Operator
 
@@ -275,3 +329,25 @@ class Cut(ElemOperator):
         lft_etd = lft_etd + ll
         rght_etd = rght_etd + rr
         return lft_etd, rght_etd
+
+#: Operators that only make sense on a minute axis.  They are **not** part of the
+#: default :data:`qlib.data.ops.OpsList`, so a minute experiment used to fail with
+#: ``NameError`` unless every caller remembered to pass ``custom_ops``.  Qlib now
+#: registers them automatically whenever a minute provider is configured; keeping
+#: them in one exported list means there is a single place to add new ones.
+HIGH_FREQ_OPS = [
+    DayCumsum,
+    DayLast,
+    DayOpen,
+    PrevDayLast,
+    BarOfDay,
+    FFillNan,
+    BFillNan,
+    Date,
+    Select,
+    IsNull,
+    IsInf,
+    Cut,
+]
+
+HIGH_FREQ_OP_NAMES = [op.__name__ for op in HIGH_FREQ_OPS]
