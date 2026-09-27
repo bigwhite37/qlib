@@ -34,6 +34,7 @@ import os
 import re
 import tempfile
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
@@ -57,6 +58,16 @@ DUCKDB_SUFFIXES = (".duckdb", ".ddb", ".db")
 # 2 GB and can be overridden with SLEEVE_DUCKDB_MEMORY_LIMIT.
 DEFAULT_MEMORY_LIMIT = os.environ.get("SLEEVE_DUCKDB_MEMORY_LIMIT", "2GB")
 
+# Worker threads per DuckDB connection.
+#
+# Left unset, DuckDB sizes its pool to the machine's core count and a single
+# read will occupy every core.  Callers that run under a CPU budget need this
+# bounded: the feature reads are many small queries against one symbol's rows,
+# so they do not parallelise well anyway, and the scan competes with qlib's own
+# workers and LightGBM.  Override with SLEEVE_DUCKDB_THREADS; set it to an empty
+# string to restore DuckDB's own default.
+DEFAULT_THREADS = os.environ.get("SLEEVE_DUCKDB_THREADS") or None
+
 # A fallback temporary directory.  It can be overridden with the
 # ``temp_directory`` keyword.  We use a process-wide sub-directory so that
 # connections in the same process share DuckDB's temp files naturally.
@@ -66,6 +77,27 @@ DEFAULT_TEMP_DIRECTORY = str(Path(tempfile.gettempdir()) / "qlib_duckdb")
 # connection.  Keeping the connection alive avoids opening the database for each
 # single expression read.
 _CONNECTION_STATE = threading.local()
+
+# Cache of MIN/MAX trade_index per (database, feature table, instrument).
+#
+# ``start_index``/``end_index`` depend only on the instrument and the table, but
+# qlib constructs one storage object per (instrument, field) and each of them
+# would otherwise issue its own pair of aggregates.  With the 20 alpha features
+# the loader asks for, that is 40 aggregates per instrument where 2 suffice.
+# Measured on a 261-instrument universe with 20 features: 10,584 MIN and 10,584
+# MAX calls costing 63.7s out of 76.3s of total query time (91.3s wall), i.e.
+# 83% of the query cost was duplicate work.
+#
+# The cache is process-local and keyed by the instrument, which is safe because
+# this backend opens the database READ-ONLY: the bounds cannot change underneath
+# a running process.
+_INDEX_BOUNDS_CACHE: Dict[Tuple[str, str, str], Tuple[Optional[int], Optional[int]]] = {}
+_INDEX_BOUNDS_LOCK = threading.Lock()
+
+#: ``(db_path, feature_table)`` pairs whose bounds have been primed into the
+#: cache in one pass.  Once a table is listed here the cache is complete for it,
+#: so a miss means "no active rows for that symbol" rather than "not queried".
+_INDEX_BOUNDS_PRIMED: set = set()
 
 # Feature columns which can be read from ``qlib_daily_features``.  Keep this
 # allow-list explicit; it prevents SQL injection through the ``field`` argument.
@@ -113,6 +145,12 @@ _FEATURE_COLUMNS.update(
         "nav_ref_lag_days": "nav_ref_lag_days",
         # 满窗口校验：该 ETF 截至当日的有效日线记录数。
         "valid_history_days": "valid_history_days",
+        # L1 的**原始**执行窗口证据：过去 20 个交易日里有多少天的
+        # "严格晚于 14:50 至收盘"成交额是真实存在的。用它门控可以避免"要求连续 20 天
+        # 的派生中位数都非空"，后者把 20 日要求放大成约 39 日且只证明中位数的中位数。
+        "l1_window_valid_days": "l1_window_valid_days",
+        "l1_window_complete": "l1_window_complete",
+        "l1_window_expected_days": "l1_window_expected_days",
     }
 )
 
@@ -121,6 +159,78 @@ _FEATURE_COLUMNS.update(
 #: builds a fresh storage object for every ``(instrument, field)`` pair.
 _TABLE_COLUMN_CACHE: Dict[Tuple[str, str], frozenset] = {}
 
+# ---------------------------------------------------------------------------
+# Per-instrument column block read-ahead.
+#
+# ``_read_range`` used to issue one SQL statement per ``(instrument, field)``.
+# An expression such as ``Corr($close, Log($volume+1), 5)`` touches several base
+# fields, and several expressions in the same request touch the same field
+# again, so a single instrument costs as many statements as there are leaves in
+# the expression tree -- measured at 9.1 statements per instrument for a
+# 5-expression request over the whole A-share universe (55,968 statements,
+# 167.7s of the 195.4s total).
+#
+# The access pattern is strongly local: instrument-major, with every read for
+# one instrument issued back-to-back (measured: 80 instruments -> exactly 80
+# contiguous runs, 400 reads covering only 240 distinct pairs).  That makes it
+# worthwhile to fetch *every* feature column for one instrument in a single
+# statement and serve the individual fields from the in-memory block.
+#
+# The block spans the instrument's own ``[start_index, end_index]``, so any
+# sub-range a caller asks for is a slice of it.  The database is opened
+# READ-ONLY, so a cached block can never go stale while a process is running.
+# ---------------------------------------------------------------------------
+
+#: Whether the block read-ahead is enabled.  Set to 0 to fall back to one
+#: statement per field (useful when bisecting a data discrepancy).
+_BLOCK_READ_ENABLED = os.environ.get("QLIB_DUCKDB_BLOCK_READ", "1") not in ("0", "false", "False")
+
+#: Instrument blocks kept resident.  The access pattern only needs a handful
+#: (the block for the instrument currently being evaluated), so a small bound is
+#: enough and it caps memory regardless of universe size.  One block is at most
+#: ~2850 trading days x ~10 columns x 4 bytes ~= 114 KiB on the daily warehouse.
+_BLOCK_CACHE_CAPACITY = int(os.environ.get("QLIB_DUCKDB_BLOCK_CACHE", "8"))
+
+#: Skip the block path for windows that are too narrow to benefit (widening a
+#: point into ten columns is pure overhead).
+_BLOCK_MIN_ROWS = int(os.environ.get("QLIB_DUCKDB_BLOCK_MIN_ROWS", "8"))
+
+#: Extra trading days fetched ahead of the requested window, to cover the
+#: lookbacks Qlib adds to ``start_index`` per expression without a refetch.
+_BLOCK_PAD_ROWS = int(os.environ.get("QLIB_DUCKDB_BLOCK_PAD", "256"))
+
+#: Hard cap on one block, so a single entry cannot grow without bound.
+_BLOCK_MAX_ROWS = int(os.environ.get("QLIB_DUCKDB_BLOCK_MAX_ROWS", "4000"))
+
+#: ``(database, table, instrument, end_index) -> (block_start_index, frame)``
+_BLOCK_COLUMNS_CACHE: Dict[Tuple[str, str], Tuple[str, ...]] = {}
+_BLOCK_CACHE: "OrderedDict[Tuple[str, str, str, int], Tuple[int, pd.DataFrame]]" = OrderedDict()
+_BLOCK_LOCK = threading.Lock()
+_BLOCK_STATS = {"fetches": 0, "hits": 0, "rows": 0}
+
+
+def block_read_stats() -> Dict[str, object]:
+    """Report column-block read-ahead activity (for diagnostics and tests)."""
+
+    with _BLOCK_LOCK:
+        return {
+            "enabled": _BLOCK_READ_ENABLED,
+            "fetches": _BLOCK_STATS["fetches"],
+            "hits": _BLOCK_STATS["hits"],
+            "resident": len(_BLOCK_CACHE),
+            "capacity": _BLOCK_CACHE_CAPACITY,
+        }
+
+
+def clear_read_caches() -> None:
+    """Drop read-ahead/metadata at an explicit provider initialization boundary."""
+    with _BLOCK_LOCK:
+        _BLOCK_CACHE.clear()
+        _BLOCK_COLUMNS_CACHE.clear()
+    with _INDEX_BOUNDS_LOCK:
+        _INDEX_BOUNDS_CACHE.clear()
+        _INDEX_BOUNDS_PRIMED.clear()
+    _TABLE_COLUMN_CACHE.clear()
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 
 # Minute frequencies need their own tables: a 1-minute calendar carries one label
@@ -259,6 +369,8 @@ def _connection_config(memory_limit, temp_directory, max_temp_directory_size, th
         # Bounding temporary files is a useful complement to the memory-bound
         # requirement.  If the caller doesn't set it, use the memory limit.
         config["max_temp_directory_size"] = max_temp_directory_size or memory_limit
+    if threads is None:
+        threads = DEFAULT_THREADS
     if threads is not None:
         config["threads"] = int(threads)
     return config
@@ -600,6 +712,23 @@ class DuckDBInstrumentStorage(DuckDBStorageMixin, InstrumentStorage):
         "BJ": "BJ",
     }
 
+    # Markets that span more than one exchange prefix.  The Beijing Stock
+    # Exchange is deliberately absent: it is a small, illiquid board whose
+    # return distribution is not comparable with the Shanghai/Shenzhen main
+    # boards, so "Mainland A-shares" means SH+SZ.
+    _COMPOSITE_MARKETS = {
+        "A": ("SH", "SZ"),
+        "ASHARE": ("SH", "SZ"),
+        "A_SHARE": ("SH", "SZ"),
+        "AS": ("SH", "SZ"),
+        "CN_A": ("SH", "SZ"),
+        "MAIN": ("SH", "SZ"),
+        "MAINBOARD": ("SH", "SZ"),
+        "SH_SZ": ("SH", "SZ"),
+        "SHSZ": ("SH", "SZ"),
+        "SZ_SH": ("SH", "SZ"),
+    }
+
     def __init__(
         self,
         market: str,
@@ -635,6 +764,10 @@ class DuckDBInstrumentStorage(DuckDBStorageMixin, InstrumentStorage):
         upper_market = market.upper()
         if upper_market in {"", "ALL", "CN", "CHINA", "STOCK", "STOCKS"}:
             return "", []
+        composite = self._COMPOSITE_MARKETS.get(upper_market)
+        if composite is not None:
+            clause = " OR ".join("qlib_symbol LIKE ?" for _ in composite)
+            return f"({clause})", [f"{ex}%" for ex in composite]
         exchange = self._EXCHANGE_ALIASES.get(upper_market, upper_market)
         if exchange in {"SH", "SZ", "BJ"}:
             return "qlib_symbol LIKE ?", [f"{exchange}%"]
@@ -922,29 +1055,103 @@ class DuckDBFeatureStorage(DuckDBStorageMixin, FeatureStorage):
             selected.extend(catalogue.get(month, ()))
         return selected
 
+    def _index_bounds(self) -> Tuple[Optional[int], Optional[int]]:
+        """Return ``(start_index, end_index)`` for this instrument, cached.
+
+        Both bounds are properties of the instrument, not of the field, so the
+        result is shared by every field's storage object.  Without this cache
+        each field repeats the two aggregates (see ``_INDEX_BOUNDS_CACHE``).
+        """
+        key = (str(self._db_path), str(self._feature_table), str(self.instrument))
+        with _INDEX_BOUNDS_LOCK:
+            cached = _INDEX_BOUNDS_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        if self._prime_index_bounds():
+            # Priming just cached every instrument in the table, this one
+            # included, so read the answer back instead of recomputing it.  It
+            # is tempting to set `bounds = (None, None)` here for "the symbol is
+            # not in the table", but that also overwrites the entry priming has
+            # already written correctly -- which silently returned (None, None)
+            # for the very first instrument asked about.
+            with _INDEX_BOUNDS_LOCK:
+                primed = _INDEX_BOUNDS_CACHE.get(key)
+                if primed is None:
+                    primed = (None, None)
+                    _INDEX_BOUNDS_CACHE[key] = primed
+            return primed
+
+        min_row = self._fetchone(
+            f"SELECT MIN(trade_index) FROM {self._feature_table} "
+            "WHERE qlib_symbol = ? AND row_status = 'active'",
+            [self.instrument],
+        )
+        max_row = self._fetchone(
+            f"SELECT MAX(trade_index) FROM {self._feature_table} "
+            "WHERE qlib_symbol = ? AND row_status = 'active'",
+            [self.instrument],
+        )
+        bounds: Tuple[Optional[int], Optional[int]] = (
+            None if min_row is None or min_row[0] is None else int(min_row[0]),
+            None if max_row is None or max_row[0] is None else int(max_row[0]),
+        )
+        with _INDEX_BOUNDS_LOCK:
+            _INDEX_BOUNDS_CACHE[key] = bounds
+        return bounds
+
+    def _prime_index_bounds(self) -> bool:
+        """Fill the bounds cache for the whole table in one aggregate.
+
+        The per-instrument form issued two full scans per symbol.  On the
+        A-share universe that is 4,389 symbols x 2 = 8,778 queries, measured at
+        36.3s of a 218s ``qrun`` run (17%).  ``GROUP BY qlib_symbol`` answers all
+        of them in a single pass: measured 40-61ms against 29.1s, roughly 500x.
+
+        Returns True when this call did the priming, or when the table was
+        already primed, i.e. whenever the cache can be trusted to be complete.
+        """
+
+        prime_key = (str(self._db_path), str(self._feature_table))
+        with _INDEX_BOUNDS_LOCK:
+            if prime_key in _INDEX_BOUNDS_PRIMED:
+                return True
+        try:
+            rows = self._fetchall(
+                f"SELECT qlib_symbol, MIN(trade_index), MAX(trade_index) "
+                f"FROM {self._feature_table} "
+                f"WHERE row_status = 'active' GROUP BY qlib_symbol"
+            )
+        except Exception as exc:  # pragma: no cover - fall back, never break a read
+            logger.warning(
+                "could not prime instrument index bounds for %s (%s); "
+                "falling back to per-instrument queries",
+                self._feature_table,
+                exc,
+            )
+            return False
+        with _INDEX_BOUNDS_LOCK:
+            for symbol, lo, hi in rows:
+                _INDEX_BOUNDS_CACHE[(prime_key[0], prime_key[1], str(symbol))] = (
+                    None if lo is None else int(lo),
+                    None if hi is None else int(hi),
+                )
+            _INDEX_BOUNDS_PRIMED.add(prime_key)
+        return True
+
     @property
     def start_index(self) -> Optional[int]:
         if self._minute_freq:
             calendar = self.minute_calendar
             return None if calendar is None else 0
-        row = self._fetchone(
-            f"SELECT MIN(trade_index) FROM {self._feature_table} "
-            "WHERE qlib_symbol = ? AND row_status = 'active'",
-            [self.instrument],
-        )
-        return None if row is None or row[0] is None else int(row[0])
+        return self._index_bounds()[0]
 
     @property
     def end_index(self) -> Optional[int]:
         if self._minute_freq:
             calendar = self.minute_calendar
             return None if calendar is None else len(calendar.trade_dates) - 1
-        row = self._fetchone(
-            f"SELECT MAX(trade_index) FROM {self._feature_table} "
-            "WHERE qlib_symbol = ? AND row_status = 'active'",
-            [self.instrument],
-        )
-        return None if row is None or row[0] is None else int(row[0])
+        return self._index_bounds()[1]
 
     @property
     def data(self) -> pd.Series:
@@ -959,6 +1166,151 @@ class DuckDBFeatureStorage(DuckDBStorageMixin, FeatureStorage):
     def _empty_series(self) -> pd.Series:
         return pd.Series(dtype=np.float32)
 
+    def _block_columns(self) -> List[str]:
+        """Feature columns to pull in one block, cached per (database, table)."""
+
+        key = (str(self.db_path), self._feature_table)
+        cached = _BLOCK_COLUMNS_CACHE.get(key)
+        if cached is None:
+            present = self._present_columns()
+            if not present:
+                # The schema could not be read; the caller falls back to the
+                # single-column path rather than guessing at column names.
+                cached = ()
+            else:
+                seen = set()
+                columns = []
+                for column in _FEATURE_COLUMNS.values():
+                    if column in present and column not in seen:
+                        seen.add(column)
+                        columns.append(column)
+                cached = tuple(columns)
+            _BLOCK_COLUMNS_CACHE[key] = cached
+        return list(cached)
+
+    def _read_column_block(self, start: int, end: int) -> Optional[pd.DataFrame]:
+        """Read every feature column for this instrument in ONE statement.
+
+        Blocks are keyed by ``(instrument, end)`` and span ``[start - PAD, end]``.
+        The window varies per expression -- Qlib extends ``start_index`` by each
+        expression's lookback -- while ``end`` is the same for the whole request,
+        so keying on ``end`` lets the widest block serve every expression.  PAD
+        covers the lookbacks that would otherwise force a refetch, at the cost of
+        a few hundred extra rows out of the ten columns already being pulled.
+
+        Keying on the instrument's *full history* instead is measurably worse:
+        2850 rows x 10 columns against 300 x 1 costs more than the round trips
+        it saves (403.8s vs 302.6s for a 5-expression A-share request).
+
+        Returns ``None`` when the block path does not apply (minute frequency, no
+        readable schema, a window too narrow to be worth widening, or a window
+        too wide to keep resident); callers then use the per-field path.
+        """
+
+        if not _BLOCK_READ_ENABLED or self._minute_freq:
+            return None
+        if start is None or end is None or end < start:
+            return None
+
+        start, end = int(start), int(end)
+        if end - start + 1 < _BLOCK_MIN_ROWS or end - start + 1 > _BLOCK_MAX_ROWS:
+            return None
+
+        columns = self._block_columns()
+        if not columns:
+            return None
+
+        key = (str(self.db_path), self._feature_table, str(self.instrument), end)
+        with _BLOCK_LOCK:
+            entry = _BLOCK_CACHE.get(key)
+            if entry is not None:
+                block_start, block = entry
+                if block_start <= start:
+                    _BLOCK_CACHE.move_to_end(key)
+                    _BLOCK_STATS["hits"] += 1
+                    return block
+
+        # Widen to cover the expression lookbacks; never shrink an existing block,
+        # since a later expression may ask for the wider window again.
+        fetch_start = start - _BLOCK_PAD_ROWS
+        if entry is not None:
+            fetch_start = min(fetch_start, entry[0])
+        storage_start = self.start_index
+        if storage_start is not None:
+            fetch_start = max(fetch_start, int(storage_start))
+        if end - fetch_start + 1 > _BLOCK_MAX_ROWS:
+            fetch_start = end - _BLOCK_MAX_ROWS + 1
+        if fetch_start > start:
+            fetch_start = start
+
+        # The dedup window function is the same one ``_read_range`` uses for a
+        # single column; widening the projection to every column does not change
+        # which row wins per (instrument, trade_date).
+        projection = ", ".join(columns)
+        sql = f"""
+            SELECT trade_index, {projection}
+            FROM (
+                SELECT
+                    trade_index,
+                    {projection},
+                    row_number() OVER (
+                        PARTITION BY trade_date
+                        ORDER BY {self._ROW_KIND_PRIORITY} DESC, batch_id DESC
+                    ) AS rn
+                FROM {self._feature_table}
+                WHERE qlib_symbol = ?
+                  AND row_status = 'active'
+                  AND trade_index >= ?
+                  AND trade_index <= ?
+            ) AS feature_versions
+            WHERE rn = 1
+            ORDER BY trade_index
+        """
+        expected_index = pd.RangeIndex(fetch_start, end + 1)
+        # Read as Arrow and build the frame from whole columns.  The obvious
+        # spelling -- `[float(row[i + 1]) if row[i + 1] is not None else np.nan
+        # for row in rows]` per column -- is a Python loop over every cell, i.e.
+        # `columns x rows` iterations per block, and this runs once per
+        # instrument.  Measured over one A-share round: 4,201 blocks costing
+        # 31.8s, which was the largest single item in the whole qrun.
+        arrow = self._connection.execute(sql, [self.instrument, fetch_start, end]).fetch_arrow_table()
+        if arrow.num_rows:
+            actual_index = pd.Index(
+                arrow.column(0).to_numpy(zero_copy_only=False).astype("int64")
+            )
+            block = pd.DataFrame(
+                {
+                    # `index=actual_index` on the Series, NOT on the DataFrame.
+                    # Passing it to the DataFrame makes pandas re-align every
+                    # Series against it, and a Series built from a bare array
+                    # carries a RangeIndex(0..n-1) that does not overlap the
+                    # calendar indices at all -- which silently produced an
+                    # all-NaN block.
+                    column: pd.Series(
+                        arrow.column(i + 1).to_numpy(zero_copy_only=False),
+                        index=actual_index,
+                        dtype=np.float32,
+                    )
+                    for i, column in enumerate(columns)
+                }
+            )
+            # Mirror ``_read_range``: qlib's file storage returns a contiguous
+            # series for the requested range with NaN on missing dates.  The
+            # padded head needs this too, otherwise the slice a caller takes
+            # later would not line up with the absolute calendar index.
+            if not block.index.equals(expected_index):
+                block = block.reindex(expected_index)
+        else:
+            block = pd.DataFrame(index=expected_index)
+
+        with _BLOCK_LOCK:
+            _BLOCK_CACHE[key] = (fetch_start, block)
+            _BLOCK_CACHE.move_to_end(key)
+            while len(_BLOCK_CACHE) > _BLOCK_CACHE_CAPACITY:
+                _BLOCK_CACHE.popitem(last=False)
+            _BLOCK_STATS["fetches"] += 1
+        return block
+
     def _read_range(self, start: int, end: int) -> pd.Series:
         """Read ``[start, end]`` (calendar index, both closed) for one symbol."""
 
@@ -966,17 +1318,30 @@ class DuckDBFeatureStorage(DuckDBStorageMixin, FeatureStorage):
             return self._empty_series()
         if self._minute_freq and self.minute_source is not None:
             return self._read_minute_range(int(start), int(end))
-        column = self._field_sql()
+        column = self._field_column
         if column is None:
             logger.debug("Feature %r is not present in DuckDB table %s", self.field, self._feature_table)
             return self._empty_series()
 
+        block = self._read_column_block(start, end)
+        if block is not None and column in block.columns:
+            if block.empty:
+                return self._empty_series()
+            expected_index = pd.RangeIndex(int(start), int(end) + 1)
+            series = block[column]
+            if not series.index.equals(expected_index):
+                series = series.reindex(expected_index)
+            return series.astype(np.float32, copy=False).rename(None)
+
+        sql_column = self._field_sql()
+        if sql_column is None:
+            return self._empty_series()
         sql = f"""
             SELECT trade_index, value
             FROM (
                 SELECT
                     trade_index,
-                    {column} AS value,
+                    {sql_column} AS value,
                     row_number() OVER (
                         PARTITION BY trade_date
                         ORDER BY {self._ROW_KIND_PRIORITY} DESC, batch_id DESC
@@ -1098,6 +1463,7 @@ __all__ = [
     "MINUTE_SOURCE_TABLE",
     "MinuteSource",
     "MinuteCalendar",
+    "block_read_stats",
     "check_minute_expression",
     "is_duckdb_uri",
     "is_minute_freq",
